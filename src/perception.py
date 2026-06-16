@@ -180,62 +180,90 @@ class PerceptionModule:
         return pred_logits.cpu().numpy() # for use in evaluation work
     
     def get_image_costmap(self):
+        """
+        Returns egocentric costmap of the scene
+        """
+        
         return self.image_costmap.copy()
         
     def get_top_down_environment_state(self):
+        """
+        Returns a top-down segmentation map used to determine surfaces at every location
+        The map is a one-hot encoded 3D array of shape (num_classes, H, W) 
+        Areas with no segmentation predictions will have a 1 in the background class channel and 0s in all other channels.
+        The states are interpolated to fill missing values due to perspective and each value is the closest class to the gound plane at that loation
+        The camera/robot is located at the top center of the map, at 0, W/2
+        """
         
         # Get the class with the highest probability for each pixel
         class_indices = np.argmax(self.environment_state, axis=2)  # Shape: (H, W)
         
+        # assign classes to each point in the point cloud
         points_with_class = np.concatenate((self.point_cloud, class_indices[..., np.newaxis]), axis=-1)
         points_with_class = points_with_class.reshape(-1, 4)  # Reshape to (num_points, 4) where columns are (X, Y, Z, Class)
         points_with_class = points_with_class[~np.isnan(points_with_class).any(axis=1)]  # Filter out points with NaN values
         points_with_class = points_with_class[np.flip(points_with_class[:, 1].argsort(), axis=0)]  # reversed Sort by y-coordinate
         
+        # create 2D environment map with height and width defined by the bounds of the point cloud
         width = int(np.nanmax(points_with_class[:, 0]) - np.nanmin(points_with_class[:, 0])) + 1
         height = int(np.nanmax(points_with_class[:, 2]) - np.nanmin(points_with_class[:, 2])) + 1
         ground_plane_state_map = np.zeros((height, width), dtype=np.int32) - 1  # Initialize with -1 for unknown areas
         ground_plane_state_map[(points_with_class[:, 2] - np.nanmin(points_with_class[:, 2])).astype(int), 
                               (points_with_class[:, 0] - np.nanmin(points_with_class[:, 0])).astype(int)] = points_with_class[:, 3].astype(int)  # Assign class values to the ground plane state map
         
+        # intepolate to fill in missing values in the state map due to perspective
         data_points = np.where(ground_plane_state_map >= 0)
         values = ground_plane_state_map[data_points]
         fill_points = np.where(ground_plane_state_map < 0)
         interpolated_values = griddata(data_points, values, fill_points, method='nearest', fill_value=-1)  # Fill in missing values with nearest neighbor interpolation
         ground_plane_state_map[fill_points] = interpolated_values.astype(int)
         
-        ground_plane_state_map = np.flip(ground_plane_state_map, axis=0)  # Flip vertically for correct orientation
+        # ground_plane_state_map = np.flip(ground_plane_state_map, axis=0)  # Flip vertically for visualization
         
         ground_plane_state_map = F.one_hot(torch.from_numpy(ground_plane_state_map.copy()).long(), num_classes=len(self.prompts) + 1).permute(2, 0, 1).numpy()  # Convert back to one-hot encoding for consistency
         
         return ground_plane_state_map
     
     def get_top_down_costmap(self):
+        """
+        Returns a top-down cost map used to determine the cost at particular points in the environment
+        The map is a 2D array of shape (H, W) where each pixel value corresponds to the cost of that location
+        The costs are interpolated to fill missing values due to perspective
+        The camera/robot is located at the top center of the map, at 0, W/2
+        """
+        
+        # assign cost values to each point in the point cloud
         points_with_cost = np.concatenate((self.point_cloud, self.image_costmap[..., np.newaxis]), axis=-1)
         points_with_cost = points_with_cost.reshape(-1, 4)  # Reshape to (num_points, 4) where columns are (X, Y, Z, Cost)
         points_with_cost = points_with_cost[~np.isnan(points_with_cost).any(axis=1)]  # Filter out points with NaN values
         points_with_cost = points_with_cost[np.flip(points_with_cost[:, 1].argsort(), axis=0)]  # reversed Sort by y-coordinate
         
+        # create 2D costmap with height and width defined by the bounds of the point cloud
         width = int(np.nanmax(points_with_cost[:, 0]) - np.nanmin(points_with_cost[:, 0])) + 1
         height = int(np.nanmax(points_with_cost[:, 2]) - np.nanmin(points_with_cost[:, 2])) + 1
         ground_plane_cost_map = np.zeros((height, width), dtype=np.float32)
         ground_plane_cost_map[(points_with_cost[:, 2] - np.nanmin(points_with_cost[:, 2])).astype(int), 
                               (points_with_cost[:, 0] - np.nanmin(points_with_cost[:, 0])).astype(int)] = points_with_cost[:, 3]  # Assign cost values to the ground plane cost map
-                
+        
+        # intepolate to fill in missing values in the cost map due to perspective 
         data_points = np.where(ground_plane_cost_map > 0)
         values = ground_plane_cost_map[data_points]
         fill_points = np.where(ground_plane_cost_map == 0)
         interpolated_values = griddata(data_points, values, fill_points, method='linear', fill_value=0)  # Fill in missing values with nearest neighbor interpolation
         ground_plane_cost_map[fill_points] = interpolated_values
         
-        ground_plane_cost_map = np.flip(ground_plane_cost_map, axis=0)  # Flip vertically for correct orientation
+        # ground_plane_cost_map = np.flip(ground_plane_cost_map, axis=0)  # Flip vertically for visualization
         
         return ground_plane_cost_map
 
-    # This function calculates the distance of the closest point from each class 
-    # to the segment of the trajectory defined by points p1 and p2
-    # do this for all classes at once to benefit more from vectorization
+    
     def get_min_distance_to_classes(self, p1, p2, range_threshold):
+        """
+        Calculates the distance of the closest point from each class 
+        to the segment of the trajectory defined by points p1 and p2
+        do this for all classes at once to benefit more from vectorization
+        TODO: change to only do planar calculation for ground robots
+        """
         
         # vector representation of the trajectory segment from p1 to p2
         vector_traversed = p2 - p1
@@ -271,11 +299,14 @@ class PerceptionModule:
         
         return min_distances, safest_points
 
-    # TODO: Modify to include information about trajectory compliance
     def get_traj_behav_cost(self, robot_frame_trajectory, full_trajectory=False):
         """
         Project robot frame trajectory points onto the camera image plane, get pixel coordinates,
-        and return the maximum cost from the costmap at the trajectory pixel locations.
+        and return the maximum and total cost from the costmap at the trajectory pixel locations.
+        Inputs:
+        - robot_frame_trajectory (np.ndarray): array of (x, y) points in the robot's frame of reference
+        
+        Returns: a visualization of the trajectory with costmap, the maximum cost along the trajectory, the total cost along the trajectory, and the pixel coordinates of the trajectory on the image.
         """
 
         # Create a copy of the behavior cost map for visualization purposes
@@ -300,7 +331,7 @@ class PerceptionModule:
         ))
 
         if traj_coords_xyz.shape[0] == 0:
-            return marked_img, 0.0
+            return marked_img, 0.0, 0, []
 
         # Apply rotation for tilt
         alpha = np.deg2rad(self.camera_tilt_angle)
@@ -351,6 +382,10 @@ class PerceptionModule:
         return marked_img, max_cost, total_cost, points
     
 def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, image_path, segmentation_gt=None, depth_gt=None):
+    """
+    Test function to run the perception module on a single image and trajectory, and visualize the results.
+    """
+    
     class_colors = [(255, 0, 0), (255, 255, 0), (255, 0, 255), (0, 0, 255), (0, 255, 0)]
     segmentation_color_map = ListedColormap(np.array(class_colors) / 255.0)
     
@@ -359,15 +394,18 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
     image = cv2.imread(image_path)
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Convert to RGB for PIL
     
+    # example trajectories for Blender scene
     # sample_trajectory = [[5, 0], [10, -2], [15, 0], [20, 0], [25, 0]] 
     sample_trajectory = [[5, 0], [10, -2], [12, -4], [13, -4], [16, -3]] 
 
     classes = ["Road", "Sidewalk", "Stop sign", "Building", "Grass"]
     
+    # get predicted cost map and environment state from the perception module
     pred_perception_module = PerceptionModule(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, classes, segmentation_model='clipseg')
     print(f"Perception Module setup time: {time.time() - setup_start_time:.2f} seconds")
     pred_logits = pred_perception_module.process_image(image)
     
+    # visualize the predicted cost map and trajectory costs
     marked_img_pred, max_cost_pred, total_cost_pred, points_pred = pred_perception_module.get_traj_behav_cost(sample_trajectory, full_trajectory=True)
     print(f"Predicted Max Cost along trajectory: {max_cost_pred}")
     print(f"Predicted Total Cost along trajectory: {total_cost_pred}")
@@ -382,14 +420,17 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
     combined_img_pred = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, marked_color_img_pred, 0.5, 0)
     cv2.imwrite("output_images/pred_marked_image.png", combined_img_pred)
     
+    # If ground truth segmentation and depth maps are provided, calculate the true cost along the trajectory and compare with the predicted cost
     if segmentation_gt is not None and depth_gt is not None:
         processing_start_time = time.time()
+        # get true cost map and environment state
         true_perception_module = PerceptionModule(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, classes)
 
         true_perception_module.process_image(image, segmentation_gt=segmentation_gt, depth_gt=depth_gt)
         print(f"Image processing time: {time.time() - processing_start_time:.2f} seconds")
         
         cost_start_time = time.time()
+        # visualize the true cost map and trajectory costs
         marked_img, max_cost, total_cost, points = true_perception_module.get_traj_behav_cost(sample_trajectory, full_trajectory=True)
         print(f"Trajectory cost calculation time: {time.time() - cost_start_time:.2f} seconds")
         
@@ -407,6 +448,7 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
         combined_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, marked_color_img, 0.5, 0)
         cv2.imwrite("output_images/gt_marked_image.png", combined_img)
     
+        # evaluate predicted segmentation and cost map against ground truth along the trajectory
         cost_error = np.abs(gt_path_costs - pred_path_costs)
         print(gt_path_costs.dtype, pred_path_costs.dtype, cost_error.dtype)
         print(min(gt_path_costs - pred_path_costs), max(gt_path_costs - pred_path_costs))
@@ -448,6 +490,7 @@ def single_image_test(intrinsic_matrix, offset_x, offset_y, height, tilt_angle, 
         combined_gt_segmentation_img = cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.5, colored_gt_segmentation, 0.5, 0)
         cv2.imwrite("output_images/gt_segmentation.png", combined_gt_segmentation_img)
     
+    # visualize the predicted segmentation map
     pred_env_state = pred_perception_module.environment_state
     pred_segmentation = np.argmax(pred_env_state, axis=2)
     colored_pred_segmentation = segmentation_color_map(pred_segmentation / (len(classes) + 1))[:, :, :3]  # Normalize for colormap and convert to RGB
@@ -480,11 +523,12 @@ if __name__ == "__main__":
     
     print("Loading ground truth segmentation and depth maps...")
 
-    camera_height = 0.559221 + 0.503693 # for the blender image test
-    camera_tilt = -3.14505439503068
+    camera_height = 0.559221 + 0.503693 #m for the blender image test
+    camera_tilt = -3.14505439503068 # degrees
     proj_matrix = intrinsic_matrix @ np.hstack((np.eye(3), np.zeros((3, 1))))
 
     if args.gt_path is not None:
+        # if given gt from blender, use gt maps and extrinsic matrix
         gt_maps = np.load(args.gt_path)
         segmentation = gt_maps['segmentation_masks']
         depth = gt_maps['depth_map']
