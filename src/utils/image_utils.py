@@ -12,6 +12,112 @@ import cv2
 def to_numpy(tensor):
     return tensor.cpu().detach().numpy()
 
+def transform_points(T: np.ndarray, P: np.ndarray) -> np.ndarray:
+    """Apply 4x4 transform to Nx3 points; returns Nx3."""
+    assert T.shape == (4, 4)
+    N = P.shape[0]
+    Ph = np.hstack([P, np.ones((N, 1))])
+    Qh = (T @ Ph.T).T
+    return Qh[:, :3]
+
+def project_points_cam(K: np.ndarray, dist, P_cam: np.ndarray) -> np.ndarray:
+    """
+    Project Nx3 camera-frame points to pixels. No distortion if dist is None.
+    https://www.geeksforgeeks.org/computer-vision/mapping-coordinates-from-3d-to-2d-using-opencv-python/
+    K: Camera intrinsic matrix 3x3
+    P_cam: these are the points
+    dist??
+    """
+    if P_cam is None:
+        return np.empty((0, 2), dtype=np.float32)
+    P_cam = np.asarray(P_cam, dtype=np.float64).reshape(-1, 3)
+    if P_cam.size == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    # Drop non-finite rows to avoid cv2 errors
+    finite_mask = np.all(np.isfinite(P_cam), axis=1)
+    P_cam = P_cam[finite_mask]
+    if P_cam.size == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    rvec = np.zeros((3, 1), dtype=np.float64)
+    tvec = np.zeros((3, 1), dtype=np.float64)
+    pts2d, _ = cv2.projectPoints(P_cam.astype(np.float64), rvec, tvec, K, None)
+    return pts2d.reshape(-1, 2)
+
+def clip_to_bottom_xy(poly_xy: np.ndarray, img_h: int) -> np.ndarray:
+    """Clip a [x,y] polyline to the bottom scanline y=img_h-1, inserting the exact intersection."""
+    if poly_xy is None or len(poly_xy) == 0:
+        return poly_xy
+    pts = poly_xy.astype(float, copy=True)
+    yb = float(img_h - 2)
+
+    # Already starts on the bottom row?
+    if abs(pts[0,1] - yb) < 1e-6:
+        return pts
+
+    # Find first adjacent segment that spans yb and insert intersection
+    for i in range(len(pts)-1):
+        y0, y1 = pts[i,1], pts[i+1,1]
+        if y0 == y1:
+            if abs(y0 - yb) < 1e-6:
+                return pts[i:].copy()
+            continue
+        if (y0 - yb) * (y1 - yb) <= 0:  # spans scanline
+            # print(y0, y1, pts[i,0], pts[i+1,0])
+            t = (yb - y0) / (y1 - y0)
+            # t = max(0.0, min(1.0, t))
+            x = pts[i,0] + t * (pts[i+1,0] - pts[i,0])
+            inter = np.array([[x, yb]], dtype=float)
+            return np.vstack([inter, pts[i+1:]])
+
+    # No crossing (entire poly above): optional extrapolation
+    if len(pts) >= 2 and pts[0,1] != pts[1,1]:
+        t = (yb - pts[0,1]) / (pts[1,1] - pts[0,1])
+        x = pts[0,0] + t * (pts[1,0] - pts[0,0])
+    else:
+        x = pts[0,0]
+    inter = np.array([[x, yb]], dtype=float)
+    return np.vstack([inter, pts])
+
+def project_clip(poly_b_xyz: np.ndarray, T_cam_from_base, K, dist, H: int, W: int,
+                 clip_to_bottom=True) -> np.ndarray:
+    """base→cam→image, then clip to bottom and (optionally) densify first segment. Returns [x,y] float."""
+    poly_b_xyz[:, 2] = 0.0
+    poly_c = transform_points(T_cam_from_base, poly_b_xyz)  # (N,3), camera frame
+    pts_xy = project_points_cam(K, dist, poly_c)  # (N,2) [x,y], image frame
+
+    if pts_xy.size == 0:
+        return pts_xy
+    if clip_to_bottom:
+        pts_xy = clip_to_bottom_xy(pts_xy, H)
+
+    # if smooth_first:
+    #     pts_xy = densify_first_segment_xy(pts_xy, px_step=2.0)
+
+    # clamp to bounds to be safe
+    pts_xy[:, 0] = np.clip(pts_xy[:, 0], 0, W - 1)
+    pts_xy[:, 1] = np.clip(pts_xy[:, 1], 0, H - 1)
+
+    return pts_xy
+
+
+def clean_2d(arr, W, H, max_jump_px=300):
+    # keep finite + in-bounds
+    arr = arr[np.isfinite(arr).all(axis=1)]
+    arr = arr[(arr[:,0]>=0)&(arr[:,0]<W)&(arr[:,1]>=0)&(arr[:,1]<H)]
+    if len(arr) < 2:
+        return arr
+    # cut at first large jump to avoid across-screen segments
+    jumps = np.linalg.norm(np.diff(arr,axis=0),axis=1)
+    bad = np.where(jumps < max_jump_px)
+    return arr if len(bad)==0 else arr[bad]
+
+def draw_polyline(img: np.ndarray, points_2d: np.ndarray,
+                  edge_thickness: int = 2,
+                  edge_color = (0,0,200),):
+    cv2.polylines(img, [points_2d.astype(int)], isClosed=False, color=edge_color, thickness=edge_thickness,
+                  lineType=cv2.LINE_AA)
 
 def transform_images(pil_imgs: List[PILImage.Image], image_size: List[int], img_aspect_ratio, center_crop: bool = False) -> torch.Tensor:
     """Transforms a list of PIL image to a torch tensor."""

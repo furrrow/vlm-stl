@@ -151,4 +151,8 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
-# add your custom .gitigore files here:
+# custom ignores
+# output files can generally be ignored unless we want to keep specific examples
+src/output/*
+src/rta/logs/*
+src/rta/plots/*
