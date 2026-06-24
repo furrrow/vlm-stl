@@ -225,14 +225,6 @@ class PerceptionModule:
         
         ground_plane_state_map = F.one_hot(torch.from_numpy(ground_plane_state_map.copy()).long(), num_classes=len(self.prompts) + 1).permute(2, 0, 1).numpy()  # Convert back to one-hot encoding for consistency
         
-        class_colors = [(0, 0, 0), (255, 0, 0), (255, 255, 0), (255, 0, 255), (0, 0, 255), (0, 255, 0)]
-        segmentation_color_map = ListedColormap(np.array(class_colors) / 255.0)
-        
-        plt.imshow(np.argmax(ground_plane_state_map, axis=0), cmap=segmentation_color_map, vmin=0, vmax=len(self.prompts) + 1)  # Visualize the top-down environment state map
-        plt.title("Top-Down Environment State Map")
-        plt.xlabel("X (1/10 meters)")
-        plt.ylabel("Z (1/10 meters)")
-        plt.show()
         return ground_plane_state_map
     
     def get_top_down_costmap(self):
